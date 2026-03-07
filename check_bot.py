@@ -302,7 +302,7 @@ class MangaBuffAPI:
                 return False, "CSRF токен не найден"
             
             print(f"[LOGIN DEBUG] CSRF токен: {csrf}")
-            print(f"[LOGIN DEBUG] Login/Email: {login_or_email}")
+            print(f"[LOGIN DEBUG] Email: {login_or_email}")
             print(f"[LOGIN DEBUG] Длина пароля: {len(password)}")
             
             time.sleep(1.5)
@@ -324,14 +324,14 @@ class MangaBuffAPI:
                 "x-xsrf-token": csrf,
             }
             
-            # Используем поле 'login' (может быть email или никнейм)
+            # ИСПРАВЛЕНО: Используем поле 'email' вместо 'login'
             login_data = {
-                "login": login_or_email,
+                "email": login_or_email,  # <--- ВАЖНО: изменено с "login" на "email"
                 "password": password, 
                 "remember": "on"
             }
             
-            print(f"[LOGIN] Отправка form-data с полем 'login'...")
+            print(f"[LOGIN] Отправка form-data с полем 'email'...")
             resp = self.session.post(
                 f"{self.BASE_URL}/login", 
                 data=login_data,
