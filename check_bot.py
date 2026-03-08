@@ -5,7 +5,7 @@ MangaBuff Club AutoCheck Bot
 - Проверяет карту клуба каждые N секунд
 - Если карта есть — жертвует автоматически
 - Управление аккаунтами и прокси
-- Мультивклад — все аккаунты параллельно
+- Мультивклад — все аккаунты параллельно с защитой от перегрузки
 """
 
 import os
@@ -21,6 +21,8 @@ from datetime import datetime
 import hashlib
 import random
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 try:
     import telebot
@@ -39,6 +41,10 @@ BOT_TOKEN = ""  # Укажи свой токен бота
 
 config = {}
 
+# Глобальный семафор для ограничения количества одновременных запросов к серверу
+# Это предотвратит перегрузку и сброс соединений
+REQUEST_SEMAPHORE = threading.Semaphore(3)  # максимум 3 одновременных запроса
+
 def load_config():
     global config
     if CONFIG_FILE.exists():
@@ -49,9 +55,9 @@ def load_config():
     config.setdefault("bot_token", BOT_TOKEN)
     config.setdefault("club_slug", "")
     config.setdefault("club_account_name", "")
-    config.setdefault("check_interval", 30)  # секунд между проверками
+    config.setdefault("check_interval", 45)  # УВЕЛИЧЕНО: секунд между проверками
     config.setdefault("account_delay", 2)     # задержка между аккаунтами
-    config.setdefault("max_workers", 5)       # максимум параллельных потоков
+    config.setdefault("max_workers", 2)       # УМЕНЬШЕНО: максимум параллельных потоков
 
 def save_config():
     CONFIG_FILE.write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -74,7 +80,7 @@ def save_accounts(accounts):
     ACCOUNTS_FILE.write_text(json.dumps(accounts, ensure_ascii=False, indent=2), encoding="utf-8")
 
 # ============================================================
-# MangaBuff API
+# MangaBuff API с защитой от перегрузки
 # ============================================================
 class MangaBuffAPI:
     BASE_URL = "https://mangabuff.ru"
@@ -123,6 +129,17 @@ class MangaBuffAPI:
         except ImportError:
             self.session = requests.Session()
             self._use_cffi = False
+            
+            # НАСТРОЙКА ПОВТОРНЫХ ПОПЫТОК для requests
+            retry_strategy = Retry(
+                total=3,
+                backoff_factor=1,
+                status_forcelist=[429, 500, 502, 503, 504],
+                allowed_methods=["HEAD", "GET", "POST", "PUT", "DELETE", "OPTIONS", "TRACE"]
+            )
+            adapter = HTTPAdapter(max_retries=retry_strategy)
+            self.session.mount("http://", adapter)
+            self.session.mount("https://", adapter)
         
         # Прокси
         proxy_host = self.account.get("proxy_host", "")
@@ -260,7 +277,8 @@ class MangaBuffAPI:
             "x-xsrf-token": csrf,
         }
     
-    def _get(self, url, referer="", timeout=15):
+    def _get(self, url, referer="", timeout=30):  # УВЕЛИЧЕН ТАЙМАУТ
+        """GET запрос с защитой от перегрузки и повторными попытками"""
         headers = {
             "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
             "sec-ch-ua": self._sec_ch_ua,
@@ -274,19 +292,47 @@ class MangaBuffAPI:
         }
         if referer:
             headers["referer"] = referer
-        return self.session.get(url, headers=headers, timeout=timeout)
+        
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                # Используем семафор для ограничения одновременных запросов
+                with REQUEST_SEMAPHORE:
+                    response = self.session.get(url, headers=headers, timeout=timeout)
+                    return response
+            except (requests.exceptions.ConnectionError, 
+                    requests.exceptions.Timeout,
+                    ConnectionResetError) as e:
+                if attempt == max_retries - 1:
+                    print(f"[_GET] ❌ Все попытки не удались для {url}: {e}")
+                    raise
+                wait_time = (attempt + 1) * 2
+                print(f"[_GET] ⚠️ Попытка {attempt + 1} не удалась, жду {wait_time}с...")
+                time.sleep(wait_time)
     
-    def _post(self, url, data=None, json=None, referer="", timeout=15):
-        """Универсальный POST с поддержкой JSON"""
+    def _post(self, url, data=None, json=None, referer="", timeout=30):  # УВЕЛИЧЕН ТАЙМАУТ
+        """Универсальный POST с поддержкой JSON и защитой от перегрузки"""
         headers = self._get_headers_with_csrf(referer)
         
-        if json is not None:
-            # Если переданы JSON данные, меняем content-type
-            headers["content-type"] = "application/json; charset=UTF-8"
-            return self.session.post(url, json=json, headers=headers, timeout=timeout)
-        else:
-            # Обычный form-urlencoded запрос
-            return self.session.post(url, data=data, headers=headers, timeout=timeout)
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                with REQUEST_SEMAPHORE:
+                    if json is not None:
+                        headers["content-type"] = "application/json; charset=UTF-8"
+                        response = self.session.post(url, json=json, headers=headers, timeout=timeout)
+                    else:
+                        response = self.session.post(url, data=data, headers=headers, timeout=timeout)
+                    return response
+            except (requests.exceptions.ConnectionError,
+                    requests.exceptions.Timeout,
+                    ConnectionResetError) as e:
+                if attempt == max_retries - 1:
+                    print(f"[_POST] ❌ Все попытки не удались для {url}: {e}")
+                    raise
+                wait_time = (attempt + 1) * 2
+                print(f"[_POST] ⚠️ Попытка {attempt + 1} не удалась, жду {wait_time}с...")
+                time.sleep(wait_time)
     
     def login(self, login_or_email, password):
         """HTTP-логин: GET /login -> CSRF -> POST /login -> проверка"""
@@ -336,7 +382,7 @@ class MangaBuffAPI:
                 f"{self.BASE_URL}/login", 
                 data=login_data,
                 headers=headers_form,
-                timeout=15,
+                timeout=30,
                 allow_redirects=False
             )
             
@@ -458,25 +504,39 @@ class MangaBuffAPI:
 def parse_club_boost(api, club_slug):
     result = {"card_id": None, "card_image": "", "donated": 0, "needed": 0, "has_card": False}
     url = f"https://mangabuff.ru/clubs/{club_slug}/boost"
-    resp = api._get(url)
-    if resp.status_code != 200:
-        return result
-    html = resp.text
     
-    match = re.search(r'href="/cards/(\d+)/users"', html)
-    if match:
-        result["card_id"] = match.group(1)
+    try:
+        resp = api._get(url)
+        if resp.status_code != 200:
+            print(f"[PARSE] ❌ HTTP {resp.status_code} для {url}")
+            return result
+        
+        html = resp.text
+        
+        # Проверка на страницу логина
+        if 'action="/login"' in html or 'Вход' in html or 'войти' in html.lower():
+            print(f"[PARSE] ⚠️ Обнаружена страница логина, требуется реавторизация")
+            result["needs_login"] = True
+            return result
+        
+        match = re.search(r'href="/cards/(\d+)/users"', html)
+        if match:
+            result["card_id"] = match.group(1)
+        
+        match = re.search(r'club-boost__image[^>]*>\s*<img src="([^"]+)"', html)
+        if match:
+            result["card_image"] = match.group(1)
+        
+        match = re.search(r'club-boost__change[^>]*>.*?<span>(\d+)</span>\s*/\s*(\d+)', html, re.S)
+        if match:
+            result["donated"] = int(match.group(1))
+            result["needed"] = int(match.group(2))
+        
+        result["has_card"] = "У вас нет этой карты" not in html
+        
+    except Exception as e:
+        print(f"[PARSE] ❌ Ошибка: {e}")
     
-    match = re.search(r'club-boost__image[^>]*>\s*<img src="([^"]+)"', html)
-    if match:
-        result["card_image"] = match.group(1)
-    
-    match = re.search(r'club-boost__change[^>]*>.*?<span>(\d+)</span>\s*/\s*(\d+)', html, re.S)
-    if match:
-        result["donated"] = int(match.group(1))
-        result["needed"] = int(match.group(2))
-    
-    result["has_card"] = "У вас нет этой карты" not in html
     return result
 
 
@@ -489,7 +549,8 @@ def donate_card_to_club(api, club_slug):
             result["error"] = f"HTTP {resp.status_code}"
             return result
         
-        time.sleep(0.1)  # Уменьшенная задержка
+        # Случайная задержка перед пожертвованием (1-2 секунды)
+        time.sleep(random.uniform(1, 2))
         
         resp = api._post("https://mangabuff.ru/clubs/boost", data={}, referer=boost_url)
         
@@ -565,14 +626,19 @@ def get_card_name_cached(api, card_id):
 
 
 # ============================================================
-# МУЛЬТИВКЛАД (ПАРАЛЛЕЛЬНАЯ ВЕРСИЯ)
+# МУЛЬТИВКЛАД (ОПТИМИЗИРОВАННАЯ ВЕРСИЯ)
 # ============================================================
 check_running = False
 check_stop = threading.Event()
 
 def check_single_account(account, club_slug, account_stats, current_card_name, current_progress):
-    """Проверка одного аккаунта (для параллельного выполнения)"""
+    """Проверка одного аккаунта с защитой от перегрузки"""
     acc_name = account.get("name", "unknown")
+    
+    # СЛУЧАЙНАЯ ЗАДЕРЖКА перед началом работы аккаунта (1-3 секунды)
+    # Это распределяет нагрузку во времени
+    delay = random.uniform(1, 3)
+    time.sleep(delay)
     
     try:
         api = MangaBuffAPI(account)
@@ -586,6 +652,12 @@ def check_single_account(account, club_slug, account_stats, current_card_name, c
         
         # Получаем информацию о карте
         acc_club_info = parse_club_boost(api, club_slug)
+        
+        # Проверяем, не требует ли страница логина
+        if acc_club_info.get("needs_login"):
+            print(f"[MULTI] ⚠️ {acc_name}: требуется повторная авторизация")
+            account_stats[acc_name]["errors"] += 1
+            return None
         
         if not acc_club_info["has_card"]:
             print(f"[MULTI] ⏳ {acc_name}: карты нет")
@@ -621,8 +693,8 @@ def check_single_account(account, club_slug, account_stats, current_card_name, c
         return None
 
 
-def check_accounts_cycle(chat_id, club_slug, interval=30, account_delay=2):
-    """Цикл проверки всех аккаунтов параллельно"""
+def check_accounts_cycle(chat_id, club_slug, interval=45, account_delay=2):
+    """Цикл проверки всех аккаунтов с оптимизацией нагрузки"""
     global check_running
     check_running = True
     check_stop.clear()
@@ -640,10 +712,11 @@ def check_accounts_cycle(chat_id, club_slug, interval=30, account_delay=2):
         check_running = False
         return
     
-    max_workers = config.get("max_workers", 5)
-    print(f"\n[MULTI] Запуск мультивклада (ПАРАЛЛЕЛЬНЫЙ): {len(valid_accounts)} аккаунтов")
+    max_workers = config.get("max_workers", 2)  # УМЕНЬШЕНО ДО 2
+    print(f"\n[MULTI] Запуск мультивклада (ОПТИМИЗИРОВАННЫЙ): {len(valid_accounts)} аккаунтов")
     print(f"[MULTI] Клуб: {club_slug}, интервал: {interval}с, потоков: {max_workers}")
-    bot.send_message(chat_id, f"✅ Мультивклад запущен (ПАРАЛЛЕЛЬНЫЙ РЕЖИМ)\n👥 Аккаунтов: {len(valid_accounts)}\n⚙️ Потоков: {max_workers}\n🏠 {club_slug}\n⏱ Интервал: {interval}с")
+    print(f"[MULTI] ⚠️ РЕЖИМ ПОНИЖЕННОЙ НАГРУЗКИ для предотвращения сброса соединений")
+    bot.send_message(chat_id, f"✅ Мультивклад запущен (ЩАДЯЩИЙ РЕЖИМ)\n👥 Аккаунтов: {len(valid_accounts)}\n⚙️ Потоков: {max_workers}\n🏠 {club_slug}\n⏱ Интервал: {interval}с\n🛡 Защита от перегрузки активна")
     
     total_donated = 0
     cycle = 0
@@ -658,6 +731,12 @@ def check_accounts_cycle(chat_id, club_slug, interval=30, account_delay=2):
         # Получаем информацию о текущей карте (используем первый аккаунт для проверки)
         first_api = MangaBuffAPI(valid_accounts[0])
         club_info = parse_club_boost(first_api, club_slug)
+        
+        if club_info.get("needs_login"):
+            print(f"[MULTI] ⚠️ Аккаунт {valid_accounts[0].get('name')} требует реавторизации")
+            bot.send_message(chat_id, f"⚠️ Аккаунт {valid_accounts[0].get('name')} требует повторного входа!")
+            check_stop.wait(interval)
+            continue
         
         if not club_info["card_id"]:
             print(f"[MULTI] ❌ Карта не найдена, ждем {interval}с")
@@ -674,13 +753,14 @@ def check_accounts_cycle(chat_id, club_slug, interval=30, account_delay=2):
             print(f"[MULTI] Новая карта: {current_card_name} (ID:{card_id}) {progress}")
             bot.send_message(chat_id, f"🃏 Новая карта: {current_card_name}\n📊 {progress}")
         
-        # ПАРАЛЛЕЛЬНАЯ ПРОВЕРКА АККАУНТОВ
-        print(f"[MULTI] Запуск параллельной проверки {len(valid_accounts)} аккаунтов ({max_workers} потоков)...")
+        # ПАРАЛЛЕЛЬНАЯ ПРОВЕРКА АККАУНТОВ С ОГРАНИЧЕНИЯМИ
+        print(f"[MULTI] Запуск проверки {len(valid_accounts)} аккаунтов (макс. {max_workers} потоков)...")
         
         # Перемешиваем аккаунты для равномерной нагрузки
         random.shuffle(valid_accounts)
         
         # Используем ThreadPoolExecutor для параллельной обработки
+        donation_count_in_cycle = 0
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = []
             for account in valid_accounts:
@@ -690,20 +770,19 @@ def check_accounts_cycle(chat_id, club_slug, interval=30, account_delay=2):
                 futures.append(future)
             
             # Собираем результаты по мере завершения
-            donation_count_in_cycle = 0
             for future in as_completed(futures):
                 if check_stop.is_set():
                     break
                 try:
-                    result = future.result(timeout=30)
+                    result = future.result(timeout=45)  # УВЕЛИЧЕН ТАЙМАУТ
                     if result and result.get("success"):
                         total_donated += 1
                         donation_count_in_cycle += 1
                         acc_name = result.get("name")
                         new_progress = result.get("new_progress")
                         
-                        # Отправляем сообщение о пожертвовании (но не спамим)
-                        if donation_count_in_cycle <= 3 or donation_count_in_cycle % 5 == 0:
+                        # Отправляем сообщение о пожертвовании реже
+                        if donation_count_in_cycle <= 2 or donation_count_in_cycle % 3 == 0:
                             bot.send_message(chat_id, 
                                 f"🎁 {acc_name} пожертвовал {current_card_name}\n"
                                 f"📊 {progress} → {new_progress}\n"
@@ -712,7 +791,7 @@ def check_accounts_cycle(chat_id, club_slug, interval=30, account_delay=2):
                         progress = new_progress
                         
                         # Маленькая задержка между отправками сообщений
-                        time.sleep(0.5)
+                        time.sleep(1)
                 except Exception as e:
                     print(f"[MULTI] Ошибка при обработке результата: {e}")
         
@@ -838,14 +917,15 @@ def cmd_multistart(message):
         bot.send_message(chat_id, "❌ Нет валидных аккаунтов! /addacc")
         return
     
-    interval = config.get("check_interval", 30)
-    max_workers = config.get("max_workers", 5)
+    interval = config.get("check_interval", 45)
+    max_workers = config.get("max_workers", 2)
     
-    bot.send_message(chat_id, f"🚀 Запуск мультивклада (ПАРАЛЛЕЛЬНЫЙ РЕЖИМ)\n"
+    bot.send_message(chat_id, f"🚀 Запуск мультивклада (ЩАДЯЩИЙ РЕЖИМ)\n"
                              f"👥 Аккаунтов: {len(valid_accounts)}\n"
                              f"⚙️ Потоков: {max_workers}\n"
                              f"🏠 Клуб: {club_slug}\n"
-                             f"⏱ Интервал циклов: {interval}с")
+                             f"⏱ Интервал циклов: {interval}с\n"
+                             f"🛡 Защита от перегрузки: активна")
     
     threading.Thread(
         target=check_accounts_cycle,
@@ -875,8 +955,8 @@ def cmd_status(message):
     accounts = load_accounts()
     valid_count = len([a for a in accounts if a.get("status") == "valid"])
     club_slug = config.get("club_slug", "")
-    interval = config.get("check_interval", 30)
-    max_workers = config.get("max_workers", 5)
+    interval = config.get("check_interval", 45)
+    max_workers = config.get("max_workers", 2)
     status = "🟢 Запущен" if check_running else "🔴 Остановлен"
     
     bot.send_message(chat_id,
@@ -928,12 +1008,12 @@ def cmd_setclub(message):
 def cmd_setinterval(message):
     parts = message.text.split()
     if len(parts) < 2:
-        bot.send_message(message.chat.id, "❌ Использование: /setinterval 30")
+        bot.send_message(message.chat.id, "❌ Использование: /setinterval 45")
         return
     try:
         val = int(parts[1])
-        if val < 5:
-            val = 5
+        if val < 10:  # УВЕЛИЧЕНО минимальное значение
+            val = 10
         config["check_interval"] = val
         save_config()
         bot.send_message(message.chat.id, f"✅ Интервал между циклами: {val}с")
@@ -946,14 +1026,14 @@ def cmd_setworkers(message):
     """Установка количества параллельных потоков"""
     parts = message.text.split()
     if len(parts) < 2:
-        bot.send_message(message.chat.id, "❌ Использование: /setworkers 5")
+        bot.send_message(message.chat.id, "❌ Использование: /setworkers 2")
         return
     try:
         val = int(parts[1])
         if val < 1:
             val = 1
-        if val > 20:
-            val = 20  # ограничение
+        if val > 5:  # УМЕНЬШЕНО максимальное значение
+            val = 5
         config["max_workers"] = val
         save_config()
         bot.send_message(message.chat.id, f"✅ Максимум параллельных потоков: {val}")
@@ -968,7 +1048,7 @@ def cmd_addacc(message):
     parts = message.text.split(maxsplit=3)
     if len(parts) < 3:
         bot.send_message(chat_id, "📝 Использование: /addacc email password host:port:user:pass\n"
-                                 "Пример: /addacc 0508719526@mail.ru 12345678aze! 45.94.228.73:8000:uaYsD5:AhoS7U")
+                                 "Пример: /addacc Qurbanovomar08@mail.ru 12345678aze! 45.94.228.73:8000:uaYsD5:AhoS7U")
         return
     
     email = parts[1]
@@ -1084,8 +1164,8 @@ def handle_buttons(message):
         if check_running:
             bot.send_message(chat_id, "⚠️ Уже запущен! Нажми ⏹ Стоп")
             return
-        interval = config.get("check_interval", 30)
-        max_workers = config.get("max_workers", 5)
+        interval = config.get("check_interval", 45)
+        max_workers = config.get("max_workers", 2)
         threading.Thread(
             target=check_accounts_cycle,
             args=(chat_id, club_slug, interval, config.get("account_delay", 2)),
@@ -1118,8 +1198,8 @@ def handle_buttons(message):
         accounts = load_accounts()
         valid_count = len([a for a in accounts if a.get("status") == "valid"])
         club_slug = config.get("club_slug", "")
-        interval = config.get("check_interval", 30)
-        max_workers = config.get("max_workers", 5)
+        interval = config.get("check_interval", 45)
+        max_workers = config.get("max_workers", 2)
         status = "🟢 Запущен" if check_running else "🔴 Остановлен"
         bot.send_message(chat_id,
             f"📊 Статус\n"
@@ -1131,15 +1211,15 @@ def handle_buttons(message):
         )
     
     elif text == "⚙️ Настройки":
-        interval = config.get("check_interval", 30)
-        max_workers = config.get("max_workers", 5)
+        interval = config.get("check_interval", 45)
+        max_workers = config.get("max_workers", 2)
         bot.send_message(chat_id,
             f"⚙️ Текущие настройки:\n"
             f"⏱ Интервал между циклами: {interval}с\n"
             f"⚙️ Параллельных потоков: {max_workers}\n\n"
             f"Для изменения:\n"
             f"/setinterval N — интервал циклов\n"
-            f"/setworkers N — количество потоков (1-20)"
+            f"/setworkers N — количество потоков (1-5)"
         )
 
 
@@ -1147,7 +1227,14 @@ def handle_buttons(message):
 # ЗАПУСК
 # ============================================================
 if __name__ == "__main__":
-    print("🤖 MangaBuff Club AutoCheck Bot (Мультивклад + Параллельный режим)")
+    print("🤖 MangaBuff Club AutoCheck Bot (ОПТИМИЗИРОВАННАЯ ВЕРСИЯ)")
+    print("=" * 60)
+    print("✅ Особенности:")
+    print("   • Семафор для ограничения одновременных запросов")
+    print("   • Автоматические повторные попытки при сбоях")
+    print("   • Случайные задержки для распределения нагрузки")
+    print("   • Пониженное количество потоков (2 по умолчанию)")
+    print("   • Увеличенные интервалы и таймауты")
     print("=" * 60)
     
     accounts = load_accounts()
@@ -1156,8 +1243,8 @@ if __name__ == "__main__":
     valid_count = len([a for a in accounts if a.get("status") == "valid"])
     print(f"✅ Валидных: {valid_count}")
     print(f"🏠 Клуб: {config.get('club_slug', 'не задан')}")
-    print(f"⏱ Интервал циклов: {config.get('check_interval', 30)}с")
-    print(f"⚙️ Параллельных потоков: {config.get('max_workers', 5)}")
+    print(f"⏱ Интервал циклов: {config.get('check_interval', 45)}с")
+    print(f"⚙️ Параллельных потоков: {config.get('max_workers', 2)}")
     print()
     
     token = config.get("bot_token", BOT_TOKEN)
@@ -1167,13 +1254,13 @@ if __name__ == "__main__":
         sys.exit(1)
     
     print("✅ Бот запущен! Доступные команды:")
-    print("   /multistart - запуск мультивклада (ПАРАЛЛЕЛЬНО)")
+    print("   /multistart - запуск мультивклада (ЩАДЯЩИЙ РЕЖИМ)")
     print("   /stop - остановка")
     print("   /status - статус")
     print("   /accounts - список аккаунтов")
     print("   /setclub - установить клуб")
-    print("   /setinterval - интервал между циклами")
-    print("   /setworkers - количество потоков (1-20)")
+    print("   /setinterval - интервал между циклами (мин. 10с)")
+    print("   /setworkers - количество потоков (1-5)")
     print("   /addacc - добавить аккаунт")
     print("\n🖱 Или используй кнопки в Telegram")
     print("=" * 60)
