@@ -209,20 +209,28 @@ class MangaBuffAPI:
                         self.session.cookies.set(name, value, domain=domain)
     
     def check_auth(self):
-        try:
-            resp = self._get(f"{self.BASE_URL}/")
-            if resp.status_code == 200:
-                html = resp.text
-                match = re.search(r'data-userid="(\d+)"', html)
-                if match:
-                    return True, match.group(1)
-                if "Выйти" in html or "logout" in html.lower() or 'header__user' in html:
-                    match = re.search(r'/users/(\d+)', html)
-                    uid = match.group(1) if match else ""
-                    return True, uid
-            return False, None
-        except Exception as e:
-            return False, str(e)
+        for attempt in range(2):
+            try:
+                resp = self._get(f"{self.BASE_URL}/")
+                if resp.status_code == 200:
+                    html = resp.text
+                    match = re.search(r'data-userid="(\d+)"', html)
+                    if match:
+                        return True, match.group(1)
+                    if "Выйти" in html or "logout" in html.lower() or 'header__user' in html:
+                        match = re.search(r'/users/(\d+)', html)
+                        uid = match.group(1) if match else ""
+                        return True, uid
+                return False, None
+            except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
+                if attempt == 0:
+                    print(f"  [auth] ⚠️ Ошибка сети, пересоздаю сессию и повторяю...")
+                    time.sleep(3)
+                    self._setup_session()
+                else:
+                    return False, f"Ошибка сети: {e}"
+            except Exception as e:
+                return False, str(e)
     
     def _get_csrf_from_cookies(self):
         from urllib.parse import unquote
@@ -260,7 +268,7 @@ class MangaBuffAPI:
             "x-xsrf-token": csrf,
         }
     
-    def _get(self, url, referer="", timeout=20):  # УВЕЛИЧЕН ТАЙМАУТ
+    def _get(self, url, referer="", timeout=20, retries=3):  # УВЕЛИЧЕН ТАЙМАУТ + RETRY
         headers = {
             "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
             "sec-ch-ua": self._sec_ch_ua,
@@ -274,19 +282,53 @@ class MangaBuffAPI:
         }
         if referer:
             headers["referer"] = referer
-        return self.session.get(url, headers=headers, timeout=timeout)
-    
-    def _post(self, url, data=None, json=None, referer="", timeout=20):  # УВЕЛИЧЕН ТАЙМАУТ
-        """Универсальный POST с поддержкой JSON"""
-        headers = self._get_headers_with_csrf(referer)
         
-        if json is not None:
-            # Если переданы JSON данные, меняем content-type
-            headers["content-type"] = "application/json; charset=UTF-8"
-            return self.session.post(url, json=json, headers=headers, timeout=timeout)
-        else:
-            # Обычный form-urlencoded запрос
-            return self.session.post(url, data=data, headers=headers, timeout=timeout)
+        last_error = None
+        for attempt in range(retries):
+            try:
+                return self.session.get(url, headers=headers, timeout=timeout)
+            except (requests.exceptions.ConnectionError, 
+                    requests.exceptions.Timeout,
+                    requests.exceptions.ChunkedEncodingError) as e:
+                last_error = e
+                acc_name = self.account.get("name", "?")
+                print(f"  [_get] ⚠️ {acc_name}: попытка {attempt+1}/{retries} — {type(e).__name__}: {e}")
+                if attempt < retries - 1:
+                    wait = (attempt + 1) * 3 + random.uniform(1, 3)
+                    print(f"  [_get] Жду {wait:.1f}с перед повтором...")
+                    time.sleep(wait)
+                    # Пересоздаём сессию при ConnectionResetError
+                    if "Connection reset" in str(e) or "ConnectionReset" in str(e):
+                        print(f"  [_get] Пересоздаю сессию для {acc_name}...")
+                        self._setup_session()
+        raise last_error
+    
+    def _post(self, url, data=None, json=None, referer="", timeout=20, retries=3):  # УВЕЛИЧЕН ТАЙМАУТ + RETRY
+        """Универсальный POST с поддержкой JSON и retry"""
+        last_error = None
+        for attempt in range(retries):
+            try:
+                headers = self._get_headers_with_csrf(referer)
+                
+                if json is not None:
+                    headers["content-type"] = "application/json; charset=UTF-8"
+                    return self.session.post(url, json=json, headers=headers, timeout=timeout)
+                else:
+                    return self.session.post(url, data=data, headers=headers, timeout=timeout)
+            except (requests.exceptions.ConnectionError, 
+                    requests.exceptions.Timeout,
+                    requests.exceptions.ChunkedEncodingError) as e:
+                last_error = e
+                acc_name = self.account.get("name", "?")
+                print(f"  [_post] ⚠️ {acc_name}: попытка {attempt+1}/{retries} — {type(e).__name__}: {e}")
+                if attempt < retries - 1:
+                    wait = (attempt + 1) * 3 + random.uniform(1, 3)
+                    print(f"  [_post] Жду {wait:.1f}с перед повтором...")
+                    time.sleep(wait)
+                    if "Connection reset" in str(e) or "ConnectionReset" in str(e):
+                        print(f"  [_post] Пересоздаю сессию для {acc_name}...")
+                        self._setup_session()
+        raise last_error
     
     def login(self, login_or_email, password):
         """HTTP-логин: GET /login -> CSRF -> POST /login -> проверка"""
@@ -458,7 +500,11 @@ class MangaBuffAPI:
 def parse_club_boost(api, club_slug):
     result = {"card_id": None, "card_image": "", "donated": 0, "needed": 0, "has_card": False}
     url = f"https://mangabuff.ru/clubs/{club_slug}/boost"
-    resp = api._get(url)
+    try:
+        resp = api._get(url)
+    except Exception as e:
+        print(f"  [club] ❌ Ошибка соединения при парсинге буста: {e}")
+        return result
     if resp.status_code != 200:
         return result
     html = resp.text
@@ -517,6 +563,9 @@ def donate_card_to_club(api, club_slug):
         
         if not result["error"]:
             result["error"] = f"HTTP {resp.status_code}"
+    except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
+        result["error"] = f"Ошибка сети: {type(e).__name__}"
+        print(f"  [donate] ⚠️ Ошибка сети: {e}")
     except Exception as e:
         result["error"] = str(e)[:80]
         print(f"  [donate] ❌ {e}")
@@ -534,8 +583,10 @@ def get_card_name(api, card_id):
             name = re.sub(r'^Пользователи с картой\s*', '', name)
             name = re.sub(r'^Карта\s*', '', name)
             return name.strip() or "?"
-    except:
-        pass
+    except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
+        print(f"  [card_name] ⚠️ Ошибка сети: {e}")
+    except Exception as e:
+        print(f"  [card_name] ⚠️ {e}")
     return "?"
 
 
@@ -581,7 +632,13 @@ def check_single_account(account, club_slug, account_stats, current_card_name, c
         api = MangaBuffAPI(account)
         
         # Проверяем авторизацию
-        ok, user_id = api.check_auth()
+        try:
+            ok, user_id = api.check_auth()
+        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
+            print(f"[MULTI] ⚠️ {acc_name}: ошибка сети при auth — {e}")
+            account_stats[acc_name]["errors"] += 1
+            return None
+        
         if not ok:
             print(f"[MULTI] ❌ {acc_name}: не авторизован")
             account_stats[acc_name]["errors"] += 1
@@ -660,7 +717,15 @@ def check_accounts_cycle(chat_id, club_slug, interval=45, account_delay=3):
         
         # Получаем информацию о текущей карте (используем первый аккаунт для проверки)
         first_api = MangaBuffAPI(valid_accounts[0])
-        club_info = parse_club_boost(first_api, club_slug)
+        try:
+            club_info = parse_club_boost(first_api, club_slug)
+        except Exception as e:
+            print(f"[MULTI] ❌ Ошибка сети при проверке клуба: {e}")
+            # При ошибке соединения ждём подольше и пробуем снова
+            wait_time = min(interval * 2, 120)
+            print(f"[MULTI] Жду {wait_time}с перед повтором...")
+            check_stop.wait(wait_time)
+            continue
         
         if not club_info["card_id"]:
             print(f"[MULTI] ❌ Карта не найдена, ждем {interval}с")
