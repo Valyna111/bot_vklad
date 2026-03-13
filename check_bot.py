@@ -49,9 +49,9 @@ def load_config():
     config.setdefault("bot_token", BOT_TOKEN)
     config.setdefault("club_slug", "")
     config.setdefault("club_account_name", "")
-    config.setdefault("check_interval", 20)
-    config.setdefault("account_delay", 1.5)
-    config.setdefault("max_workers", 3)
+    config.setdefault("check_interval", 5)  # УМЕНЬШЕНО: с 20 до 5 секунд
+    config.setdefault("account_delay", 0.2)  # УМЕНЬШЕНО: с 1.5 до 0.2 секунды
+    config.setdefault("max_workers", 10)  # УВЕЛИЧЕНО: с 3 до 10 потоков
 
 def save_config():
     CONFIG_FILE.write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -268,7 +268,7 @@ class MangaBuffAPI:
             "x-xsrf-token": csrf,
         }
     
-    def _get(self, url, referer="", timeout=15, retries=2):
+    def _get(self, url, referer="", timeout=10, retries=1):  # УМЕНЬШЕНО: таймаут с 15 до 10, retries с 2 до 1
         headers = {
             "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
             "sec-ch-ua": self._sec_ch_ua,
@@ -294,7 +294,7 @@ class MangaBuffAPI:
                 acc_name = self.account.get("name", "?")
                 print(f"  [_get] ⚠️ {acc_name}: попытка {attempt+1}/{retries} — {type(e).__name__}: {e}")
                 if attempt < retries - 1:
-                    wait = (attempt + 1) * 2 + random.uniform(1, 2)
+                    wait = 0.5  # УМЕНЬШЕНО: с 2с до 0.5с
                     print(f"  [_get] Жду {wait:.1f}с перед повтором...")
                     time.sleep(wait)
                     if "Connection reset" in str(e) or "ConnectionReset" in str(e):
@@ -302,7 +302,7 @@ class MangaBuffAPI:
                         self._setup_session()
         raise last_error
     
-    def _post(self, url, data=None, json=None, referer="", timeout=15, retries=2):
+    def _post(self, url, data=None, json=None, referer="", timeout=10, retries=1):  # УМЕНЬШЕНО: таймаут с 15 до 10, retries с 2 до 1
         """Универсальный POST с поддержкой JSON и retry"""
         last_error = None
         for attempt in range(retries):
@@ -321,7 +321,7 @@ class MangaBuffAPI:
                 acc_name = self.account.get("name", "?")
                 print(f"  [_post] ⚠️ {acc_name}: попытка {attempt+1}/{retries} — {type(e).__name__}: {e}")
                 if attempt < retries - 1:
-                    wait = (attempt + 1) * 2 + random.uniform(1, 2)
+                    wait = 0.5  # УМЕНЬШЕНО: с 2с до 0.5с
                     print(f"  [_post] Жду {wait:.1f}с перед повтором...")
                     time.sleep(wait)
                     if "Connection reset" in str(e) or "ConnectionReset" in str(e):
@@ -346,7 +346,7 @@ class MangaBuffAPI:
             print(f"[LOGIN DEBUG] Email: {login_or_email}")
             print(f"[LOGIN DEBUG] Длина пароля: {len(password)}")
             
-            time.sleep(0.8)
+            time.sleep(0.3)  # УМЕНЬШЕНО: с 0.8 до 0.3
             
             # 3. Отправляем запрос на логин
             headers_form = {
@@ -396,7 +396,7 @@ class MangaBuffAPI:
                 if isinstance(resp_json, dict) and resp_json.get('status') is True:
                     print(f"[LOGIN] ✅ Успешный логин! Получаем user_id...")
                     
-                    time.sleep(0.8)
+                    time.sleep(0.3)  # УМЕНЬШЕНО: с 0.8 до 0.3
                     check_resp = self._get(f"{self.BASE_URL}/", referer=f"{self.BASE_URL}/login")
                     
                     if check_resp.status_code == 200:
@@ -448,7 +448,7 @@ class MangaBuffAPI:
                 location = resp.headers.get('location', '')
                 print(f"[LOGIN] Редирект на: {location}")
                 
-                time.sleep(0.8)
+                time.sleep(0.3)  # УМЕНЬШЕНО: с 0.8 до 0.3
                 check_resp = self._get(f"{self.BASE_URL}/", referer=f"{self.BASE_URL}/login")
                 if check_resp.status_code == 200:
                     html = check_resp.text
@@ -523,7 +523,7 @@ def donate_card_to_club(api, club_slug):
             result["error"] = f"HTTP {resp.status_code}"
             return result
         
-        time.sleep(0.5)
+        time.sleep(0.1)  # УМЕНЬШЕНО: с 0.5 до 0.1
         
         resp = api._post("https://mangabuff.ru/clubs/boost", data={}, referer=boost_url)
         
@@ -609,7 +609,7 @@ global_account_stats = {}
 def check_single_account(account, club_slug, current_card_name, current_progress):
     acc_name = account.get("name", "unknown")
     
-    time.sleep(random.uniform(0.3, 0.6))
+    time.sleep(random.uniform(0.05, 0.1))  # УМЕНЬШЕНО: с 0.3-0.6 до 0.05-0.1
     
     try:
         api = MangaBuffAPI(account)
@@ -667,7 +667,7 @@ def check_single_account(account, club_slug, current_card_name, current_progress
         return None
 
 
-def check_accounts_cycle(chat_id, club_slug, interval=20, account_delay=1.5):
+def check_accounts_cycle(chat_id, club_slug, interval=5, account_delay=0.2):  # ИЗМЕНЕНО: значения по умолчанию
     global check_running, global_account_stats
     check_running = True
     check_stop.clear()
@@ -690,7 +690,7 @@ def check_accounts_cycle(chat_id, club_slug, interval=20, account_delay=1.5):
         if acc_name not in global_account_stats:
             global_account_stats[acc_name] = {"donated": 0, "errors": 0}
     
-    max_workers = config.get("max_workers", 3)
+    max_workers = config.get("max_workers", 10)
     print(f"\n[MULTI] Запуск мультивклада: {len(valid_accounts)} аккаунтов")
     print(f"[MULTI] Клуб: {club_slug}, интервал: {interval}с, потоков: {max_workers}")
     bot.send_message(chat_id, f"✅ Мультивклад запущен\n👥 Аккаунтов: {len(valid_accounts)}\n⚙️ Потоков: {max_workers}\n🏠 {club_slug}\n⏱ Интервал: {interval}с")
@@ -709,7 +709,7 @@ def check_accounts_cycle(chat_id, club_slug, interval=20, account_delay=1.5):
             club_info = parse_club_boost(first_api, club_slug)
         except Exception as e:
             print(f"[MULTI] ❌ Ошибка сети при проверке клуба: {e}")
-            wait_time = min(interval * 1.5, 60)
+            wait_time = interval
             print(f"[MULTI] Жду {wait_time}с перед повтором...")
             check_stop.wait(wait_time)
             continue
@@ -747,7 +747,7 @@ def check_accounts_cycle(chat_id, club_slug, interval=20, account_delay=1.5):
                 if check_stop.is_set():
                     break
                 try:
-                    result = future.result(timeout=30)
+                    result = future.result(timeout=20)  # УМЕНЬШЕНО: с 30 до 20 секунд
                     if result and result.get("success"):
                         total_donated += 1
                         donation_count_in_cycle += 1
@@ -755,7 +755,7 @@ def check_accounts_cycle(chat_id, club_slug, interval=20, account_delay=1.5):
                         new_progress = result.get("new_progress")
                         
                         # Отправляем сообщение о пожертвовании (редко)
-                        if donation_count_in_cycle == 1 or donation_count_in_cycle % 8 == 0:
+                        if donation_count_in_cycle == 1 or donation_count_in_cycle % 5 == 0:  # ИЗМЕНЕНО: с 8 до 5
                             bot.send_message(chat_id, 
                                 f"🎁 {acc_name} пожертвовал {current_card_name}\n"
                                 f"📊 {progress} → {new_progress}\n"
@@ -763,7 +763,7 @@ def check_accounts_cycle(chat_id, club_slug, interval=20, account_delay=1.5):
                         
                         progress = new_progress
                         
-                        time.sleep(1)
+                        time.sleep(0.5)  # УМЕНЬШЕНО: с 1 до 0.5 секунды
                 except Exception as e:
                     print(f"[MULTI] Ошибка при обработке результата: {e}")
         
@@ -863,7 +863,7 @@ def get_keyboard():
         types.KeyboardButton("📊 Статус"),
     )
     markup.add(
-        types.KeyboardButton("📈 Статистика"),  # НОВАЯ КНОПКА
+        types.KeyboardButton("📈 Статистика"),
         types.KeyboardButton("⚙️ Настройки"),
     )
     return markup
@@ -896,8 +896,8 @@ def cmd_start(message):
         "/stats — статистика вкладов по аккаунтам\n\n"
         "⚙️ **Настройки:**\n"
         "/setclub slug — установить клуб (например: sumerechniy-rassvet)\n"
-        "/setinterval N — интервал между циклами (сек, мин. 5)\n"
-        "/setworkers N — количество потоков (1-10)\n\n"
+        "/setinterval N — интервал между циклами (сек, мин. 3)\n"  # ИЗМЕНЕНО: с 5 до 3
+        "/setworkers N — количество потоков (1-20)\n\n"  # ИЗМЕНЕНО: с 10 до 20
         "👤 **Управление аккаунтами:**\n"
         "/addacc email password host:port:user:pass — добавить аккаунт\n"
         "/setproxy имя host:port:user:pass — сменить прокси\n"
@@ -928,8 +928,8 @@ def cmd_multistart(message):
         bot.send_message(chat_id, "❌ Нет валидных аккаунтов! /addacc")
         return
     
-    interval = config.get("check_interval", 20)
-    max_workers = config.get("max_workers", 3)
+    interval = config.get("check_interval", 5)
+    max_workers = config.get("max_workers", 10)
     
     bot.send_message(chat_id, f"🚀 Запуск мультивклада\n"
                              f"👥 Аккаунтов: {len(valid_accounts)}\n"
@@ -939,7 +939,7 @@ def cmd_multistart(message):
     
     threading.Thread(
         target=check_accounts_cycle,
-        args=(chat_id, club_slug, interval, config.get("account_delay", 1.5)),
+        args=(chat_id, club_slug, interval, config.get("account_delay", 0.2)),
         daemon=True
     ).start()
 
@@ -963,8 +963,8 @@ def cmd_status(message):
     accounts = load_accounts()
     valid_count = len([a for a in accounts if a.get("status") == "valid"])
     club_slug = config.get("club_slug", "")
-    interval = config.get("check_interval", 20)
-    max_workers = config.get("max_workers", 3)
+    interval = config.get("check_interval", 5)
+    max_workers = config.get("max_workers", 10)
     status = "🟢 Запущен" if check_running else "🔴 Остановлен"
     
     bot.send_message(chat_id,
@@ -1022,12 +1022,12 @@ def cmd_setclub(message):
 def cmd_setinterval(message):
     parts = message.text.split()
     if len(parts) < 2:
-        bot.send_message(message.chat.id, "❌ Использование: /setinterval 20")
+        bot.send_message(message.chat.id, "❌ Использование: /setinterval 5")
         return
     try:
         val = int(parts[1])
-        if val < 5:
-            val = 5
+        if val < 3:  # ИЗМЕНЕНО: с 5 до 3
+            val = 3
         config["check_interval"] = val
         save_config()
         bot.send_message(message.chat.id, f"✅ Интервал между циклами: {val}с")
@@ -1039,14 +1039,14 @@ def cmd_setinterval(message):
 def cmd_setworkers(message):
     parts = message.text.split()
     if len(parts) < 2:
-        bot.send_message(message.chat.id, "❌ Использование: /setworkers 3")
+        bot.send_message(message.chat.id, "❌ Использование: /setworkers 10")
         return
     try:
         val = int(parts[1])
         if val < 1:
             val = 1
-        if val > 10:
-            val = 10
+        if val > 20:  # ИЗМЕНЕНО: с 10 до 20
+            val = 20
         config["max_workers"] = val
         save_config()
         bot.send_message(message.chat.id, f"✅ Максимум параллельных потоков: {val}")
@@ -1173,11 +1173,11 @@ def handle_buttons(message):
         if check_running:
             bot.send_message(chat_id, "⚠️ Уже запущен! Нажми ⏹ Стоп")
             return
-        interval = config.get("check_interval", 20)
-        max_workers = config.get("max_workers", 3)
+        interval = config.get("check_interval", 5)
+        max_workers = config.get("max_workers", 10)
         threading.Thread(
             target=check_accounts_cycle,
-            args=(chat_id, club_slug, interval, config.get("account_delay", 1.5)),
+            args=(chat_id, club_slug, interval, config.get("account_delay", 0.2)),
             daemon=True
         ).start()
     
@@ -1207,8 +1207,8 @@ def handle_buttons(message):
         accounts = load_accounts()
         valid_count = len([a for a in accounts if a.get("status") == "valid"])
         club_slug = config.get("club_slug", "")
-        interval = config.get("check_interval", 20)
-        max_workers = config.get("max_workers", 3)
+        interval = config.get("check_interval", 5)
+        max_workers = config.get("max_workers", 10)
         status = "🟢 Запущен" if check_running else "🔴 Остановлен"
         bot.send_message(chat_id,
             f"📊 Статус\n"
@@ -1219,19 +1219,19 @@ def handle_buttons(message):
             f"⚙️ Параллельных потоков: {max_workers}"
         )
     
-    elif text == "📈 Статистика":  # НОВАЯ КНОПКА
+    elif text == "📈 Статистика":
         send_account_stats(chat_id)
     
     elif text == "⚙️ Настройки":
-        interval = config.get("check_interval", 20)
-        max_workers = config.get("max_workers", 3)
+        interval = config.get("check_interval", 5)
+        max_workers = config.get("max_workers", 10)
         bot.send_message(chat_id,
             f"⚙️ Текущие настройки:\n"
             f"⏱ Интервал между циклами: {interval}с\n"
             f"⚙️ Параллельных потоков: {max_workers}\n\n"
             f"Для изменения:\n"
-            f"/setinterval N — интервал циклов (мин. 5)\n"
-            f"/setworkers N — количество потоков (1-10)"
+            f"/setinterval N — интервал циклов (мин. 3)\n"
+            f"/setworkers N — количество потоков (1-20)"
         )
 
 
@@ -1248,8 +1248,8 @@ if __name__ == "__main__":
     valid_count = len([a for a in accounts if a.get("status") == "valid"])
     print(f"✅ Валидных: {valid_count}")
     print(f"🏠 Клуб: {config.get('club_slug', 'не задан')}")
-    print(f"⏱ Интервал циклов: {config.get('check_interval', 20)}с")
-    print(f"⚙️ Параллельных потоков: {config.get('max_workers', 3)}")
+    print(f"⏱ Интервал циклов: {config.get('check_interval', 5)}с")
+    print(f"⚙️ Параллельных потоков: {config.get('max_workers', 10)}")
     print()
     
     token = config.get("bot_token", BOT_TOKEN)
@@ -1265,8 +1265,8 @@ if __name__ == "__main__":
     print("   /stats - статистика вкладов по аккаунтам")
     print("   /accounts - список аккаунтов")
     print("   /setclub - установить клуб")
-    print("   /setinterval - интервал между циклами (мин. 5)")
-    print("   /setworkers - количество потоков (1-10)")
+    print("   /setinterval - интервал между циклами (мин. 3)")
+    print("   /setworkers - количество потоков (1-20)")
     print("   /addacc - добавить аккаунт")
     print("\n🖱 Или используй кнопки в Telegram")
     print("=" * 60)
